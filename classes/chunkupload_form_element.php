@@ -50,13 +50,13 @@ class chunkupload_form_element extends \HTML_QuickForm_input implements \templat
     }
 
     /** @var string html for help button, if empty then no help will icon will be dispalyed. */
-    public $_helpbutton = '';
+    public $_helpbutton = ''; // phpcs:ignore PSR2.Classes.PropertyDeclaration.Underscore
 
     // PHP doesn't support 'key' => $value1 | $value2 in class definition
     // We cannot do $_options = array('return_types'=> FILE_INTERNAL | FILE_REFERENCE);.
     // So I have to set null here, and do it in constructor.
     /** @var array options provided to initalize filemanager */
-    protected $_options = ['maxbytes' => 0, 'accepted_types' => '*'];
+    protected $_options = ['maxbytes' => 0, 'accepted_types' => '*']; // phpcs:ignore PSR2.Classes.PropertyDeclaration.Underscore
 
     /**
      * Constructor
@@ -287,8 +287,13 @@ class chunkupload_form_element extends \HTML_QuickForm_input implements \templat
      * @param string $newfilepath The filepath where to export the file to.
      * @return \stored_file|null The file that is stored in the filearea.
      */
-    public static function export_to_filearea($chunkuploadid, $newcontextid, $newcomponent, $newfilearea,
-                                              $newfilepath='/') {
+    public static function export_to_filearea(
+        $chunkuploadid,
+        $newcontextid,
+        $newcomponent,
+        $newfilearea,
+        $newfilepath = '/'
+    ) {
         global $DB;
         $fs = get_file_storage();
         $record = $DB->get_record('local_chunkupload_files', ['id' => $chunkuploadid], '*', IGNORE_MISSING);
