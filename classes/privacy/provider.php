@@ -25,6 +25,7 @@
 namespace local_chunkupload\privacy;
 
 use context;
+use context_system;
 use core_privacy\local\metadata\collection;
 use core_privacy\local\request\approved_contextlist;
 use core_privacy\local\request\approved_userlist;
@@ -33,13 +34,18 @@ use core_privacy\local\request\transform;
 use core_privacy\local\request\userlist;
 use core_privacy\local\request\writer;
 use local_chunkupload\chunkupload_form_element;
+use stdClass;
 
 /**
  * Privacy provider for local_chunkupload.
  *
  * The plugin stores a temporary record per upload in {local_chunkupload_files},
- * together with the file content on the filesystem, until the cleanup task
- * removes it. The record is tied to the uploading user and the context.
+ * together with the uploaded file content on the filesystem, until the cleanup
+ * task removes it. Each record is tied to the uploading user and a context.
+ *
+ * Because the table has no foreign key on contextid and cleanup is time-based,
+ * a record can outlive the context it was created in. Such orphaned records are
+ * reported under the system context so they can still be exported and deleted.
  *
  * @package   local_chunkupload
  * @copyright 2026 Skin Cancer College Australasia
@@ -77,10 +83,24 @@ class provider implements
      */
     public static function get_contexts_for_userid(int $userid): contextlist {
         $contextlist = new contextlist();
-        $sql = "SELECT DISTINCT contextid
-                  FROM {local_chunkupload_files}
-                 WHERE userid = :userid AND contextid IS NOT NULL";
+
+        // Only return contexts that still exist; a deleted course or module can
+        // leave rows behind because the table has no cascade on contextid.
+        $sql = "SELECT DISTINCT f.contextid
+                  FROM {local_chunkupload_files} f
+                  JOIN {context} ctx ON ctx.id = f.contextid
+                 WHERE f.userid = :userid";
         $contextlist->add_from_sql($sql, ['userid' => $userid]);
+
+        // Surface orphaned rows under the system context so they remain
+        // exportable and deletable.
+        if (self::get_orphaned_ids_for_user($userid)) {
+            $contextlist->add_from_sql(
+                "SELECT id FROM {context} WHERE contextlevel = :systemlevel",
+                ['systemlevel' => CONTEXT_SYSTEM]
+            );
+        }
+
         return $contextlist;
     }
 
@@ -91,10 +111,20 @@ class provider implements
      */
     public static function get_users_in_context(userlist $userlist) {
         $context = $userlist->get_context();
+
         $sql = "SELECT userid
                   FROM {local_chunkupload_files}
                  WHERE contextid = :contextid AND userid IS NOT NULL";
         $userlist->add_from_sql('userid', $sql, ['contextid' => $context->id]);
+
+        // Orphaned rows are reported under the system context.
+        if ($context->id == context_system::instance()->id) {
+            $orphansql = "SELECT f.userid
+                            FROM {local_chunkupload_files} f
+                       LEFT JOIN {context} ctx ON ctx.id = f.contextid
+                           WHERE ctx.id IS NULL AND f.userid IS NOT NULL";
+            $userlist->add_from_sql('userid', $orphansql, []);
+        }
     }
 
     /**
@@ -104,29 +134,74 @@ class provider implements
      */
     public static function export_user_data(approved_contextlist $contextlist) {
         global $DB;
-        $user = $contextlist->get_user();
+        $userid = $contextlist->get_user()->id;
+        $systemcontextid = context_system::instance()->id;
+
         foreach ($contextlist->get_contexts() as $context) {
             $records = $DB->get_records(
                 'local_chunkupload_files',
-                ['userid' => $user->id, 'contextid' => $context->id]
+                ['userid' => $userid, 'contextid' => $context->id]
             );
-            if (!$records) {
-                continue;
+
+            // Orphaned rows are exported under the system context.
+            if ($context->id == $systemcontextid) {
+                $records += self::get_orphaned_records_for_user($userid);
             }
-            $files = [];
-            foreach ($records as $record) {
-                $files[] = (object) [
-                    'filename' => $record->filename,
-                    'state' => $record->state,
-                    'lastmodified' => $record->lastmodified ?
-                        transform::datetime($record->lastmodified) : null,
-                ];
+
+            if ($records) {
+                self::export_records($context, $records);
             }
-            writer::with_context($context)->export_data(
-                [get_string('pluginname', 'local_chunkupload')],
-                (object) ['files' => $files]
-            );
         }
+    }
+
+    /**
+     * Export the metadata and uploaded file content for a set of records.
+     *
+     * @param context $context The context to export within.
+     * @param stdClass[] $records The chunkupload records to export.
+     */
+    protected static function export_records(context $context, array $records) {
+        $writer = writer::with_context($context);
+        $subcontext = [get_string('pluginname', 'local_chunkupload')];
+
+        $metadata = [];
+        foreach ($records as $record) {
+            $metadata[] = (object) [
+                'filename' => $record->filename,
+                'state' => $record->state,
+                'lastmodified' => $record->lastmodified ?
+                    transform::datetime($record->lastmodified) : null,
+            ];
+
+            // Include the uploaded bytes still held in dataroot, if present.
+            $path = chunkupload_form_element::get_path_for_id($record->id);
+            if ($path && file_exists($path)) {
+                raise_memory_limit(MEMORY_EXTRA);
+                $writer->export_custom_file(
+                    $subcontext,
+                    self::export_filename($record),
+                    file_get_contents($path)
+                );
+                reduce_memory_limit(MEMORY_STANDARD);
+            }
+        }
+
+        $writer->export_data($subcontext, (object) ['files' => $metadata]);
+    }
+
+    /**
+     * Build a unique, non-empty export filename for a record.
+     *
+     * @param stdClass $record The chunkupload record.
+     * @return string The filename to export the content under.
+     */
+    protected static function export_filename(stdClass $record): string {
+        $name = (string) $record->filename;
+        if ($name === '') {
+            $name = 'file';
+        }
+        // Prefix with the record id to keep filenames unique within the export.
+        return $record->id . '_' . $name;
     }
 
     /**
@@ -142,6 +217,12 @@ class provider implements
             'contextid = :contextid',
             ['contextid' => $context->id]
         );
+
+        // Orphaned rows are handled under the system context.
+        if ($context->id == context_system::instance()->id) {
+            $ids = array_merge($ids, self::get_orphaned_ids());
+        }
+
         self::delete_files_for_ids($ids);
     }
 
@@ -152,18 +233,26 @@ class provider implements
      */
     public static function delete_data_for_user(approved_contextlist $contextlist) {
         global $DB;
+        $userid = $contextlist->get_user()->id;
         $contextids = $contextlist->get_contextids();
         if (!$contextids) {
             return;
         }
+
         [$insql, $params] = $DB->get_in_or_equal($contextids, SQL_PARAMS_NAMED);
-        $params['userid'] = $contextlist->get_user()->id;
+        $params['userid'] = $userid;
         $ids = $DB->get_fieldset_select(
             'local_chunkupload_files',
             'id',
             "userid = :userid AND contextid $insql",
             $params
         );
+
+        // Orphaned rows are handled under the system context.
+        if (in_array(context_system::instance()->id, $contextids)) {
+            $ids = array_merge($ids, self::get_orphaned_ids_for_user($userid));
+        }
+
         self::delete_files_for_ids($ids);
     }
 
@@ -174,19 +263,76 @@ class provider implements
      */
     public static function delete_data_for_users(approved_userlist $userlist) {
         global $DB;
+        $context = $userlist->get_context();
         $userids = $userlist->get_userids();
         if (!$userids) {
             return;
         }
+
         [$insql, $params] = $DB->get_in_or_equal($userids, SQL_PARAMS_NAMED);
-        $params['contextid'] = $userlist->get_context()->id;
+        $params['contextid'] = $context->id;
         $ids = $DB->get_fieldset_select(
             'local_chunkupload_files',
             'id',
             "contextid = :contextid AND userid $insql",
             $params
         );
+
+        // Orphaned rows are handled under the system context.
+        if ($context->id == context_system::instance()->id) {
+            [$uin, $uparams] = $DB->get_in_or_equal($userids, SQL_PARAMS_NAMED);
+            $orphansql = "SELECT f.id
+                            FROM {local_chunkupload_files} f
+                       LEFT JOIN {context} ctx ON ctx.id = f.contextid
+                           WHERE ctx.id IS NULL AND f.userid $uin";
+            $ids = array_merge($ids, $DB->get_fieldset_sql($orphansql, $uparams));
+        }
+
         self::delete_files_for_ids($ids);
+    }
+
+    /**
+     * Get the records for a user whose context no longer exists.
+     *
+     * @param int $userid The user id.
+     * @return stdClass[] The orphaned records, keyed by id.
+     */
+    protected static function get_orphaned_records_for_user(int $userid): array {
+        global $DB;
+        $sql = "SELECT f.*
+                  FROM {local_chunkupload_files} f
+             LEFT JOIN {context} ctx ON ctx.id = f.contextid
+                 WHERE f.userid = :userid AND ctx.id IS NULL";
+        return $DB->get_records_sql($sql, ['userid' => $userid]);
+    }
+
+    /**
+     * Get the ids for a user whose context no longer exists.
+     *
+     * @param int $userid The user id.
+     * @return int[] The orphaned record ids.
+     */
+    protected static function get_orphaned_ids_for_user(int $userid): array {
+        global $DB;
+        $sql = "SELECT f.id
+                  FROM {local_chunkupload_files} f
+             LEFT JOIN {context} ctx ON ctx.id = f.contextid
+                 WHERE f.userid = :userid AND ctx.id IS NULL";
+        return $DB->get_fieldset_sql($sql, ['userid' => $userid]);
+    }
+
+    /**
+     * Get all ids whose context no longer exists.
+     *
+     * @return int[] The orphaned record ids.
+     */
+    protected static function get_orphaned_ids(): array {
+        global $DB;
+        $sql = "SELECT f.id
+                  FROM {local_chunkupload_files} f
+             LEFT JOIN {context} ctx ON ctx.id = f.contextid
+                 WHERE ctx.id IS NULL";
+        return $DB->get_fieldset_sql($sql);
     }
 
     /**
