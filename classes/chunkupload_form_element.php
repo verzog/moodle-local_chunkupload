@@ -338,7 +338,7 @@ class chunkupload_form_element extends \HTML_QuickForm_input implements \templat
             return false;
         }
 
-        if (!$record->state == state_type::UPLOAD_COMPLETED) {
+        if ($record->state != state_type::UPLOAD_COMPLETED) {
             return false;
         }
         return true;

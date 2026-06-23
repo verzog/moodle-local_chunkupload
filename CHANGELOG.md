@@ -1,6 +1,14 @@
 CHANGELOG
 =========
 
+5.1.1 (2026-06-23)
+------------------
+* [PRIVACY] Add a Privacy API provider for the local_chunkupload_files table
+* [FIX] is_file_uploaded() operator precedence bug treated in-progress uploads as complete
+* [FIX] Typo in the token expired message ("recieve" -> "receive")
+* [CI] Remove obsolete Travis CI configuration (CI runs on GitHub Actions)
+
+
 5.1.0 (2026-01-17)
 ------------------
 * Moodle 5.1 compatible version
